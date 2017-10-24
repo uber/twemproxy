@@ -298,7 +298,7 @@ https://launchpad.net/~twemproxy/+archive/ubuntu/daily
 
 Have a bug or a question? Please create an issue here on GitHub!
 
-https://github.com/twitter/twemproxy/issues
+https://github.com/uber/twemproxy/issues
 
 ## Committers
 
