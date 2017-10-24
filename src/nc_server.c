@@ -22,6 +22,9 @@
 #include <nc_server.h>
 #include <nc_conf.h>
 #include <nc_proxy.h>
+#include <nc_introspect.h>
+
+#define POOL_NOINDEX    (~(uint32_t)0)
 
 static void
 server_resolve(struct server *server, struct conn *conn)
@@ -894,11 +897,36 @@ server_pool_free(struct server_pool *pool)
     nc_free(pool);  /* FIXME: memory leaks here. */
 }
 
+static void
+server_pool_move_client_connections(struct server_pool *from, struct server_pool *to) {
+    struct conn *conn, *tmp_conn;
+
+    TAILQ_INIT(&to->c_conn_q);
+    to->nc_conn_q = 0;
+
+    TAILQ_FOREACH_SAFE(conn, &from->c_conn_q, conn_tqe, tmp_conn) {
+        TAILQ_REMOVE(&from->c_conn_q, conn, conn_tqe);
+        TAILQ_INSERT_TAIL(&to->c_conn_q, conn, conn_tqe);
+        conn->owner = to;
+        to->nc_conn_q++;
+    }
+
+    ASSERT(to->nc_conn_q == from->nc_conn_q);
+
+    from->nc_conn_q = 0;
+    TAILQ_INIT(&from->c_conn_q);
+}
+
 static rstatus_t
 server_pool_deinit_fn(struct server_pool *pool, void *data) {
 
     ASSERT(pool->p_conn == NULL);
     ASSERT(TAILQ_EMPTY(&pool->c_conn_q) && pool->nc_conn_q == 0);
+
+    if (pool->pool_counterpart) {
+        pool->pool_counterpart->pool_counterpart = 0;
+        pool->pool_counterpart = 0;
+    }
 
     if (pool->continuum != NULL) {
         nc_free(pool->continuum);
@@ -940,3 +968,397 @@ server_pools_n(struct server_pools *server_pools) {
 
     return npool;
 }
+
+
+/*
+ * Convert between each (flat) and hierarchical fold.
+ */
+struct morphism_and_accumulator {
+    nc_morphism_f morphism;
+    void *accumulator;
+};
+
+static rstatus_t server_pool_each_to_fold(void *elem, void *data) {
+    struct morphism_and_accumulator *mac = data;
+    struct server *server = elem;
+    struct conn *conn;
+    uint32_t count;
+
+    mac->accumulator = mac->morphism(NC_ELEMENT_IS_SERVER,
+                                     server, mac->accumulator);
+
+    count = 0;
+    /* Iterate over server connections going to a single server. */
+    TAILQ_FOREACH(conn, &server->s_conn_q, conn_tqe) {
+        mac->accumulator = mac->morphism(NC_ELEMENT_IS_CONNECTION,
+                                         conn, mac->accumulator);
+        count++;
+    }
+    ASSERT(server->ns_conn_q == count);
+
+    return NC_OK;
+}
+
+static void *
+server_pool_fold(struct server_pool *pool, nc_morphism_f f, void *acc) {
+    struct morphism_and_accumulator mac;
+    struct conn *conn;
+    rstatus_t status;
+
+    acc = f(NC_ELEMENT_IS_POOL, pool, acc);
+
+    if(pool->p_conn)
+        acc = f(NC_ELEMENT_IS_CONNECTION, pool->p_conn, acc);
+
+    /* Iterate over client connections accessing a single pool proxy. */
+    TAILQ_FOREACH(conn, &pool->c_conn_q, conn_tqe) {
+        acc = f(NC_ELEMENT_IS_CONNECTION, conn, acc);
+    }
+
+    mac.morphism = f;
+    mac.accumulator = acc;
+
+    status = array_each(&pool->server, server_pool_each_to_fold, &mac);
+    ASSERT(status == NC_OK);
+
+    return mac.accumulator;
+}
+
+void *
+server_pools_fold(struct server_pools *server_pools, nc_morphism_f f, void *acc) {
+    struct server_pool *pool;
+
+    TAILQ_FOREACH(pool, server_pools, pool_tqe) {
+        acc = server_pool_fold(pool, f, acc);
+    }
+
+    return acc;
+}
+
+/*
+ * Set a given reload state to all pools.
+ */
+static void
+server_pools_set_reload_state(struct server_pools *server_pools, enum server_pools_reload_state state) {
+    struct server_pool *pool;
+
+    TAILQ_FOREACH(pool, server_pools, pool_tqe) {
+        pool->reload_state = state;
+    }
+}
+
+/*
+ * Check that all reload states equal to the given state.
+ */
+static bool
+server_pools_check_reload_state(struct server_pools *pools, enum server_pools_reload_state state) {
+    struct server_pool *pool;
+
+    TAILQ_FOREACH(pool, pools, pool_tqe) {
+        if(pool->reload_state != state)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * Pause ingress stream of data from clients, and accepting new ones.
+ */
+static void
+server_pool_pause_incoming_client_traffic(struct server_pool *pool) {
+    log_debug(LOG_DEBUG, "Pausing client connections for pool '%.*s' (%s)",
+              pool->name.len, pool->name.data,
+              nc_unresolve(&pool->p_conn->info));
+
+    /* Pause proxy connection (not accepting new clients) */
+    event_del_in(pool->ctx->evb, pool->p_conn);
+
+    /* Pause client connections */
+    struct conn *conn;
+    TAILQ_FOREACH(conn, &pool->c_conn_q, conn_tqe) {
+        event_del_in(pool->ctx->evb, conn);
+    }
+
+}
+
+static void
+server_pool_resume_incoming_client_traffic(struct server_pool *pool) {
+    log_debug(LOG_DEBUG, "Resume client connections for pool '%.*s' (%s)",
+              pool->name.len, pool->name.data,
+              nc_unresolve(&pool->p_conn->info));
+
+    /* Resume proxy connection (accepting new clients) */
+    event_add_in(pool->ctx->evb, pool->p_conn);
+
+    /* Resume client connections */
+    struct conn *conn;
+    TAILQ_FOREACH(conn, &pool->c_conn_q, conn_tqe) {
+        event_add_in(pool->ctx->evb, conn);
+    }
+}
+
+struct last_not_drained {
+    struct conn *conn_not_drained;
+    int num_not_drained;
+};
+
+static void *
+connection_is_drained(enum nc_morph_elem_type etype, void *elem, void *acc0) {
+
+    if(etype == NC_ELEMENT_IS_CONNECTION) {
+        struct conn *conn = elem;
+        struct last_not_drained *nd = acc0;
+
+        if((conn->rmsg == NULL
+                || msg_empty(conn->rmsg))
+            && conn->smsg == NULL
+            && TAILQ_EMPTY(&conn->imsg_q)
+            && (TAILQ_EMPTY(&conn->omsg_q)
+                || CONN_KIND_IS_CLIENT(conn))
+        ) {
+            /* Connection is effectively drained. */
+        } else {
+            nd->conn_not_drained = conn;
+            nd->num_not_drained++;
+        }
+    }
+
+    return acc0;
+}
+
+/*
+ * We decide that the pool is drained when there are no outstanding
+ * unprocessed messages in the client and server connections.
+ */
+static bool
+server_pool_drained(struct server_pool *pool) {
+    struct last_not_drained nd = { 0 };
+
+    server_pool_fold(pool, connection_is_drained, &nd);
+
+    if(nd.conn_not_drained) {
+        log_debug(LOG_DEBUG, "something (e.g. %s %s) is still not drained (%d)",
+            CONN_KIND_AS_STRING(nd.conn_not_drained),
+            conn_unresolve_descriptive(nd.conn_not_drained),
+            nd.num_not_drained);
+    }
+
+    if(nd.conn_not_drained)
+        return false;
+    else
+        return true;
+}
+
+/*
+ * For each reload state there's some things to do before we consider
+ * reloading safely initiated.
+ */
+static rstatus_t
+server_pools_kick_state_machine(struct server_pools *pools)
+{
+    struct server_pool *pool, *tpool;
+    rstatus_t rstatus;
+
+    TAILQ_FOREACH_SAFE(pool, pools, pool_tqe, tpool) {
+        switch(pool->reload_state) {
+        case RSTATE_OLD_AND_ACTIVE:
+        case RSTATE_NEW_WAIT_FOR_OLD:
+            break;
+        case RSTATE_NEW:
+            rstatus = proxy_each_init(pool, 0);
+            if(rstatus != NC_OK) {
+                return rstatus;
+            }
+            pool->reload_state = RSTATE_OLD_AND_ACTIVE;
+            break;
+        case RSTATE_OLD_TO_SHUTDOWN:
+            if(!pool->pool_counterpart) {
+                /*
+                 * This pool is not needed anymore. Shut down immediately.
+                 * NOTE: since we're are going to be able to undo
+                 * the changes, the pools are organized so the new pools
+                 * are placed at the beginning of the TAILQ. This way,
+                 * all errors to initialize the new pools can materialize
+                 * before we get to the old pools and start deiniting them.
+                 */
+                ASSERT(pool->p_conn);
+                proxy_each_deinit(pool, 0);
+                pool->p_conn = 0;
+                server_pool_deinit_fn(pool, 0);
+                break;
+            } else {
+                ASSERT(pool->p_conn);
+                server_pool_pause_incoming_client_traffic(pool);
+                pool->reload_state = RSTATE_OLD_DRAINING;
+            }
+            break;
+        case RSTATE_OLD_DRAINING:
+            if(server_pool_drained(pool)) {
+                struct server_pool *npool = pool->pool_counterpart;
+                ASSERT(pool->pool_counterpart);
+                ASSERT(npool->pool_counterpart == pool);
+                ASSERT(npool->p_conn == false);
+
+                npool->pool_counterpart = 0;
+                pool->pool_counterpart = 0;
+
+                /* Move proxy connection */
+                npool->p_conn = pool->p_conn;
+                npool->p_conn->owner = npool;
+                pool->p_conn = NULL;
+                /* Move client connections over as well */
+                server_pool_move_client_connections(pool, npool);
+                server_pool_resume_incoming_client_traffic(npool);
+                npool->reload_state = RSTATE_OLD_AND_ACTIVE;
+                server_pool_run(npool);
+
+                /* Remove the old pool*/
+                server_pool_deinit_fn(pool, 0);
+            }
+            break;
+        }
+    }
+
+    return NC_OK;
+}
+
+static void
+server_pools_undo_partial_reload(struct server_pools *pools) {
+    struct server_pool *pool, *tpool;
+
+    log_error("Can't reload configuration, reverting back pool changes");
+
+    TAILQ_FOREACH_SAFE(pool, pools, pool_tqe, tpool) {
+        switch(pool->reload_state) {
+        case RSTATE_OLD_AND_ACTIVE:
+            break;
+        case RSTATE_OLD_TO_SHUTDOWN:
+            pool->reload_state = RSTATE_OLD_AND_ACTIVE;
+            pool->pool_counterpart = 0;
+            break;
+        case RSTATE_OLD_DRAINING:
+            /* Unpause getting the data from clients */
+            server_pool_resume_incoming_client_traffic(pool);
+            pool->reload_state = RSTATE_OLD_AND_ACTIVE;
+            pool->pool_counterpart = 0;
+            break;
+        case RSTATE_NEW:
+            server_pool_deinit_fn(pool, 0);
+            break;
+        case RSTATE_NEW_WAIT_FOR_OLD:
+            server_pool_deinit_fn(pool, 0);
+            break;
+        }
+    }
+
+    /* Just checking that the state is back to normal */
+    TAILQ_FOREACH(pool, pools, pool_tqe) {
+        ASSERT(pool->reload_state == RSTATE_OLD_AND_ACTIVE);
+    }
+}
+
+rstatus_t
+server_pools_kick_replacement(struct server_pools *old_pools, struct server_pools *new_pools)
+{
+    struct server_pool *npool, *tmp_npool;
+    struct server_pool *opool;
+
+    ASSERT(server_pools_check_reload_state(old_pools, RSTATE_OLD_AND_ACTIVE));
+    ASSERT(server_pools_n(new_pools) != 0);
+
+    server_pools_set_reload_state(old_pools, RSTATE_OLD_AND_ACTIVE); server_pools_set_reload_state(new_pools, RSTATE_NEW);
+
+    /*
+     * Establish correspondence between old and new pools.
+     */
+    TAILQ_FOREACH(opool, old_pools, pool_tqe) {
+        TAILQ_FOREACH_SAFE(npool, new_pools, pool_tqe, tmp_npool) {
+            if (npool->reload_state == RSTATE_NEW && string_compare(&opool->name, &npool->name) == 0) {
+                npool->reload_state = RSTATE_NEW_WAIT_FOR_OLD;
+                opool->reload_state = RSTATE_OLD_TO_SHUTDOWN;
+                npool->pool_counterpart = opool;
+                opool->pool_counterpart = npool;
+            }
+        }
+    }
+
+    /*
+     * Initiate removal of unused pools.
+     */
+    TAILQ_FOREACH(opool, old_pools, pool_tqe) {
+        if(opool->reload_state == RSTATE_OLD_AND_ACTIVE) {
+            opool->reload_state = RSTATE_OLD_TO_SHUTDOWN;
+            opool->pool_counterpart = 0;
+        }
+    }
+
+    /*
+     * Move new pools into the new ones.
+     * NOTE: since we're are going to be able to undo
+     * the changes, the pools are organized so the new pools
+     * are placed at the beginning of the TAILQ. This way,
+     * all errors to initialize the new pools can materialize
+     * before we get to the old pools and start deiniting them.
+     * NOTE: however, the index (pool->idx) of the new pools
+     * should correspond to their natural order in the list.
+     * So we move the items one by one from the tail of the new pool
+     * into the beginning of the target pool.
+     */
+    TAILQ_FOREACH_REVERSE_SAFE(npool, new_pools, server_pools, pool_tqe, tmp_npool) {
+        TAILQ_REMOVE(new_pools, npool, pool_tqe);
+        TAILQ_INSERT_HEAD(old_pools, npool, pool_tqe);
+    }
+    new_pools = 0;  /* Do not touch this any more */
+
+    /*
+     * Kick the state machine for each of the new and old pools.
+     */
+    if(server_pools_kick_state_machine(old_pools) != NC_OK) {
+        server_pools_undo_partial_reload(old_pools);
+        return NC_ERROR;
+    } else {
+        /*
+         * Finally change the state of the new pools if everything was
+         * properly initialized (and all new proxy connections was properly
+         * bound to ip addresses).
+         */
+        TAILQ_FOREACH(opool, old_pools, pool_tqe) {
+            if(opool->reload_state == RSTATE_NEW)
+                opool->reload_state = RSTATE_OLD_AND_ACTIVE;
+        }
+    }
+
+    return NC_OK;
+}
+
+/*
+ * Attempt to complete the code reload (pool replacement) process.
+ */
+bool
+server_pools_finish_replacement(struct server_pools *pools)
+{
+
+    log_debug(LOG_DEBUG, "replacement completion test invoked");
+
+    rstatus_t rstatus;
+    rstatus = server_pools_kick_state_machine(pools);
+    ASSERT(rstatus == NC_OK);
+
+    bool finished;
+    finished = server_pools_check_reload_state(pools, RSTATE_OLD_AND_ACTIVE);
+    log_debug(LOG_DEBUG, "replacement %s",
+        finished ? "is finished" : "is still in progress");
+    return finished;
+}
+
+
+void
+server_pools_log(int level, const char *prefix, struct server_pools *pools)
+{
+    log_debug(LOG_NOTICE, "%s", prefix);
+    log_runtime_objects(LOG_NOTICE, TAILQ_FIRST(pools)->ctx, pools,
+        FRO_POOLS | FRO_SERVERS | FRO_SERVER_CONNS
+        | (level >= LOG_DEBUG ? FRO_CLIENT_CONNS : 0)
+        | (level >= LOG_DEBUG ? FRO_DETAIL_VERBOSE : 0));
+}
+

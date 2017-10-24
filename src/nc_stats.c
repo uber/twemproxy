@@ -22,6 +22,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <poll.h>
 
 #include <nc_core.h>
 #include <nc_server.h>
@@ -30,6 +31,8 @@ struct stats_desc {
     char *name; /* stats name */
     char *desc; /* stats description */
 };
+
+#define ALLOW_STATS_COLLECTION(ctx) ((ctx)->state == CTX_STATE_STEADY)
 
 #define DEFINE_ACTION(_name, _type, _desc) { .type = _type, .name = string(#_name) },
 static struct stats_metric stats_pool_codec[] = {
@@ -306,7 +309,6 @@ stats_pool_map(struct array *stats_pool, struct server_pools *server_pools)
     }
 
     status = server_pool_each(server_pools, stats_pool_each_init, stats_pool);
-
     log_debug(LOG_VVVERB, "map %"PRIu32" stats pools%s",
         npool, status == NC_OK ? "" : " failed");
 
@@ -680,6 +682,8 @@ stats_aggregate(struct stats *st)
     log_debug(LOG_PVERB, "aggregate stats shadow %p to sum %p", st->shadow.elem,
               st->sum.elem);
 
+    pthread_mutex_lock(&st->shadow_lock);
+
     for (i = 0; i < array_n(&st->shadow); i++) {
         struct stats_pool *stp1, *stp2;
         uint32_t j;
@@ -696,6 +700,8 @@ stats_aggregate(struct stats *st)
             stats_aggregate_metric(&sts2->metric, &sts1->metric);
         }
     }
+
+    pthread_mutex_unlock(&st->shadow_lock);
 
     st->aggregate = 0;
 }
@@ -792,26 +798,88 @@ stats_send_rsp(struct stats *st)
     return NC_OK;
 }
 
+#define CONTROL_BYTE_PAUSE  'P'
+#define CONTROL_BYTE_RESUME 'R'
+#define CONTROL_BYTE_EXIT   'E'
+
 static void
-stats_loop_callback(void *arg1, void *arg2)
-{
-    struct stats *st = arg1;
-    int n = *((int *)arg2);
-
-    /* aggregate stats from shadow (b) -> sum (c) */
-    stats_aggregate(st);
-    if (n == 0) {
-        return;
+stats_aggregator_ctl(struct stats *st, const char cbyte) {
+    if(st->control_wr != -1) {
+        /* Kick the aggregator */
+        (void)write(st->control_wr, &cbyte, 1);
     }
-
-    /* send aggregate stats sum (c) to collector */
-    stats_send_rsp(st);
 }
 
+void stats_pause(struct stats *st) {
+    stats_aggregator_ctl(st, CONTROL_BYTE_PAUSE);
+}
+
+void stats_resume(struct stats *st) {
+    stats_aggregator_ctl(st, CONTROL_BYTE_RESUME);
+}
+
+/*
+ * We have the control channel and the stats client acceptor channel.
+ * Use standard poll here, because it is fast enough for
+ * the infrequent task of stats reporting, and because the event
+ * subsystem has to be replaced with something generic before
+ * it'll be usable for this task.
+ */
 static void *
 stats_loop(void *arg)
 {
-    event_loop_stats(stats_loop_callback, arg);
+    struct stats *st = arg;
+    struct pollfd fds[] = {
+        { st->sd, POLLIN, 0 },          /* listen() */
+        { st->control_rd, POLLIN, 0 }   /* control channel */
+    };
+    unsigned int fds_size = sizeof(fds)/sizeof(fds[0]);
+
+    for(;;) {
+        unsigned i;
+
+        int timeout_ms = st->interval ? st->interval : -1;
+        int ret = poll(fds, fds_size, timeout_ms);
+        switch(ret) {
+        case -1:
+            if(errno == EINTR) {
+                continue;
+            }
+            log_error("Exiting stats loop due to %s", strerror(errno));
+            return NULL;
+        case 0: /* Timeout */
+            /* Aggregate each given interval */
+            /* aggregate stats from shadow (b) -> sum (c) */
+            stats_aggregate(st);
+            continue;
+        default:
+            break;
+        }
+
+        for(i = 0; i < fds_size; i++) {
+            if(fds[i].revents & POLLIN) {
+                int fd = fds[i].fd;
+                if(fd == st->sd) {
+                    stats_aggregate(st);
+                    stats_send_rsp(st);
+                } else if(fd == st->control_rd) {
+                    char c = '\0';
+                    (void)read(fd, &c, 1);
+                    switch(c) {
+                    case CONTROL_BYTE_PAUSE:
+                        fds[0].events &= ~POLLIN;
+                        break;
+                    case CONTROL_BYTE_RESUME:
+                        fds[0].events &= ~POLLIN;
+                        break;
+                    case CONTROL_BYTE_EXIT:
+                        return NULL;
+                    }
+                }
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -866,6 +934,17 @@ stats_start_aggregator(struct stats *st)
         return NC_OK;
     }
 
+    /* Establish a control channel to aggregator */
+    if(st->control_rd == -1) {
+        int fds[2];
+        if(pipe(fds) == 0) {
+            st->control_rd = fds[0];
+            st->control_wr = fds[1];
+        } else {
+            return NC_ERROR;
+        }
+    }
+
     status = stats_listen(st);
     if (status != NC_OK) {
         return status;
@@ -887,7 +966,14 @@ stats_stop_aggregator(struct stats *st)
         return;
     }
 
+    stats_aggregator_ctl(st, CONTROL_BYTE_EXIT);
+    pthread_join(st->tid, 0);   /* FIXME: do it faster */
+
+    close(st->control_wr);
+    close(st->control_rd);
     close(st->sd);
+
+    st->sd = st->control_rd = st->control_wr = -1;
 }
 
 struct stats *
@@ -912,12 +998,15 @@ stats_create(uint16_t stats_port, char *stats_ip, int stats_interval,
     st->buf.data = NULL;
     st->buf.size = 0;
 
+    pthread_mutex_init(&st->shadow_lock, 0);
     array_null(&st->current);
     array_null(&st->shadow);
     array_null(&st->sum);
 
     st->tid = (pthread_t) -1;
     st->sd = -1;
+    st->control_rd = -1;
+    st->control_wr = -1;
 
     string_set_text(&st->service_str, "service");
     string_set_text(&st->service, "nutcracker");
@@ -979,6 +1068,7 @@ stats_destroy(struct stats *st)
     stats_pool_unmap(&st->shadow);
     stats_pool_unmap(&st->current);
     stats_destroy_buf(st);
+    pthread_mutex_destroy(&st->shadow_lock);
     nc_free(st);
 }
 
@@ -1004,13 +1094,16 @@ stats_swap(struct stats *st)
     log_debug(LOG_PVERB, "swap stats current %p shadow %p", st->current.elem,
               st->shadow.elem);
 
+    pthread_mutex_lock(&st->shadow_lock);
     array_swap(&st->current, &st->shadow);
+    pthread_mutex_unlock(&st->shadow_lock);
 
     /*
      * Reset current (a) stats before giving it back to generator to keep
      * stats addition idempotent
      */
     stats_pool_reset(&st->current);
+
     st->updated = 0;
 
     st->aggregate = 1;
@@ -1024,6 +1117,8 @@ stats_pool_to_metric(struct context *ctx, struct server_pool *pool,
     struct stats_pool *stp;
     struct stats_metric *stm;
     uint32_t pidx;
+
+    ASSERT(ALLOW_STATS_COLLECTION(ctx));
 
     pidx = pool->idx;
 
@@ -1045,6 +1140,9 @@ _stats_pool_incr(struct context *ctx, struct server_pool *pool,
 {
     struct stats_metric *stm;
 
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
+
     stm = stats_pool_to_metric(ctx, pool, fidx);
 
     ASSERT(stm->type == STATS_COUNTER || stm->type == STATS_GAUGE);
@@ -1059,6 +1157,9 @@ _stats_pool_decr(struct context *ctx, struct server_pool *pool,
                  stats_pool_field_t fidx)
 {
     struct stats_metric *stm;
+
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
 
     stm = stats_pool_to_metric(ctx, pool, fidx);
 
@@ -1075,6 +1176,9 @@ _stats_pool_incr_by(struct context *ctx, struct server_pool *pool,
 {
     struct stats_metric *stm;
 
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
+
     stm = stats_pool_to_metric(ctx, pool, fidx);
 
     ASSERT(stm->type == STATS_COUNTER || stm->type == STATS_GAUGE);
@@ -1090,6 +1194,9 @@ _stats_pool_decr_by(struct context *ctx, struct server_pool *pool,
 {
     struct stats_metric *stm;
 
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
+
     stm = stats_pool_to_metric(ctx, pool, fidx);
 
     ASSERT(stm->type == STATS_GAUGE);
@@ -1104,6 +1211,9 @@ _stats_pool_set_ts(struct context *ctx, struct server_pool *pool,
                    stats_pool_field_t fidx, int64_t val)
 {
     struct stats_metric *stm;
+
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
 
     stm = stats_pool_to_metric(ctx, pool, fidx);
 
@@ -1123,6 +1233,8 @@ stats_server_to_metric(struct context *ctx, struct server *server,
     struct stats_server *sts;
     struct stats_metric *stm;
     uint32_t pidx, sidx;
+
+    ASSERT(ALLOW_STATS_COLLECTION(ctx));
 
     sidx = server->idx;
     pidx = server->owner->idx;
@@ -1146,6 +1258,9 @@ _stats_server_incr(struct context *ctx, struct server *server,
 {
     struct stats_metric *stm;
 
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
+
     stm = stats_server_to_metric(ctx, server, fidx);
 
     ASSERT(stm->type == STATS_COUNTER || stm->type == STATS_GAUGE);
@@ -1160,6 +1275,9 @@ _stats_server_decr(struct context *ctx, struct server *server,
                    stats_server_field_t fidx)
 {
     struct stats_metric *stm;
+
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
 
     stm = stats_server_to_metric(ctx, server, fidx);
 
@@ -1176,6 +1294,9 @@ _stats_server_incr_by(struct context *ctx, struct server *server,
 {
     struct stats_metric *stm;
 
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
+
     stm = stats_server_to_metric(ctx, server, fidx);
 
     ASSERT(stm->type == STATS_COUNTER || stm->type == STATS_GAUGE);
@@ -1191,6 +1312,9 @@ _stats_server_decr_by(struct context *ctx, struct server *server,
 {
     struct stats_metric *stm;
 
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
+
     stm = stats_server_to_metric(ctx, server, fidx);
 
     ASSERT(stm->type == STATS_GAUGE);
@@ -1205,6 +1329,9 @@ _stats_server_set_ts(struct context *ctx, struct server *server,
                      stats_server_field_t fidx, int64_t val)
 {
     struct stats_metric *stm;
+
+    if(!ALLOW_STATS_COLLECTION(ctx))
+        return;
 
     stm = stats_server_to_metric(ctx, server, fidx);
 

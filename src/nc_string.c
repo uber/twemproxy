@@ -101,7 +101,7 @@ string_copy(struct string *dst, const uint8_t *src, uint32_t srclen)
         return NC_ENOMEM;
     }
 
-    dst->len = srclen;
+    dst->len = (uint32_t)srclen;
     dst->data[dst->len] = '\0';
 
     return NC_OK;
