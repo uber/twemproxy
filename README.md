@@ -1,4 +1,4 @@
-# twemproxy (nutcracker) [![Build Status](https://secure.travis-ci.org/twitter/twemproxy.png)](http://travis-ci.org/twitter/twemproxy)
+# twemproxy (nutcracker) [![Build Status](https://secure.travis-ci.org/uber/twemproxy.png)](http://travis-ci.org/uber/twemproxy)
 
 **twemproxy** (pronounced "two-em-proxy"), aka **nutcracker** is a fast and lightweight proxy for [memcached](http://www.memcached.org/) and [redis](http://redis.io/) protocol. It was built primarily to reduce the number of connections to the caching servers on the backend. This, together with protocol pipelining and sharding enables you to horizontally scale your distributed caching architecture.
 
@@ -18,7 +18,7 @@ To build twemproxy from [distribution tarball](https://drive.google.com/open?id=
 
 To build twemproxy from source with _debug logs enabled_ and _assertions enabled_:
 
-    $ git clone git@github.com:twitter/twemproxy.git
+    $ git clone git@github.com:uber/twemproxy.git
     $ cd twemproxy
     $ autoreconf -fvi
     $ ./configure --enable-debug=full
